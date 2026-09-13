@@ -439,16 +439,41 @@ jobs:
                           pull_identity_id,
                           "--acr-identity",
                           pull_identity_id,
-                          "--tags",
-                          "environment=non-production",
-                          "purpose=epic76-disposable-test-agent",
-                          "epic=76",
-                          f"run_id={run_id}",
                       ],
                       # 1f fix (S2): the create response's ARM object dumps subscription
                       # id, tenant id, managed-identity client/principal ids, ACR login
                       # server, and the public IP into this PUBLIC repo's run log; none
                       # of it is needed downstream (the group name is already known).
+                      quiet=True,
+                  )
+
+                  # Story 76.5 1f fix: `az container create`'s `--tags` flag does not
+                  # exist on the runner's az-cli (verified live -- "unrecognized
+                  # arguments: --tags ...", and confirmed absent from
+                  # `az container create --help` on this same CLI). Story 76.3's own
+                  # fix-only pass that added `--tags` here was never actually re-run
+                  # live (its own Dev Agent Record says so explicitly), so this bug
+                  # shipped undetected. `az resource tag` against the container
+                  # group's own ARM resource ID is the supported equivalent.
+                  container_group_id = (
+                      f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
+                      "/providers/Microsoft.ContainerInstance/containerGroups/"
+                      f"{group_name}"
+                  )
+                  run(
+                      [
+                          "az",
+                          "resource",
+                          "tag",
+                          "--ids",
+                          container_group_id,
+                          "--tags",
+                          "environment=non-production",
+                          "purpose=epic76-disposable-test-agent",
+                          "epic=76",
+                          f"run_id={run_id}",
+                          "--is-incremental",
+                      ],
                       quiet=True,
                   )
 
