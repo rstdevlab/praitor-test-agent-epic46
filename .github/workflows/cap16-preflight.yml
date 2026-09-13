@@ -690,6 +690,7 @@ jobs:
           """
           import json
           import os
+          import re
           import subprocess
           import sys
           import urllib.error
@@ -697,6 +698,30 @@ jobs:
           import urllib.request
 
           AZURE_OIDC_AUDIENCE = "api://AzureADTokenExchange"
+
+          _GUID_RE = re.compile(
+              r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+              r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+          )
+          _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+          def scrub(text):
+              """Story 76.5 security-review fix (S2). On a DIRTY verdict `az container show`
+              exits 0 and its stdout is the FULL ARM containerGroup object -- subscription id,
+              tenant id, managed-identity client/principal ids, ACR login server, live public
+              IP -- and `az container list` likewise for every remaining group. Both were
+              written verbatim into $GITHUB_STEP_SUMMARY and stderr of this PUBLIC repo. That
+              is the identical disclosure Story 76.3's own `quiet=True` fix (S2) closed on the
+              create path, reopened here on the failure path. Redaction is STRUCTURAL (every
+              GUID and IPv4 literal) rather than schema-aware, so an arbitrary future az error
+              string is covered too; the CLEAN-path evidence this AC actually rests on (the
+              `ResourceNotFound` text and a literal `[]`) contains neither shape and is passed
+              through untouched. Also bounded -- evidence, not an unbounded log dump."""
+              scrubbed = _IPV4_RE.sub("<ip-redacted>", _GUID_RE.sub("<guid-redacted>", text))
+              if len(scrubbed) > 4000:
+                  scrubbed = scrubbed[:4000] + "\n<truncated at 4000 chars>"
+              return scrubbed
 
 
           class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -736,9 +761,22 @@ jobs:
 
 
           def run_quiet(cmd, secrets=()):
+              # Story 76.5 security-review fix (S1). Without this handler a failing `az login`
+              # raised subprocess.CalledProcessError straight into main()'s bare
+              # `except Exception`, and str(CalledProcessError) embeds exc.cmd verbatim -- i.e.
+              # the live federated OIDC bearer token -- into this PUBLIC repo's run log,
+              # relying on `::add-mask::` alone. The deploy and teardown steps' own copies of
+              # this helper already convert to a REDACTED message (Story 76.3 fix LOW-2/S3);
+              # this third copy did not. Now mirrors them exactly.
               echoed = ["***" if part in secrets else part for part in cmd]
-              print("+ " + " ".join(echoed))
-              subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)  # noqa: S603
+              printable = "+ " + " ".join(echoed)
+              print(printable)
+              try:
+                  subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)  # noqa: S603
+              except subprocess.CalledProcessError as exc:
+                  raise RuntimeError(
+                      f"command exited {exc.returncode}: {printable}"
+                  ) from exc
 
 
           def run_capture(cmd):
@@ -828,10 +866,10 @@ jobs:
                       f"- result: **{'CLEAN' if clean else 'DIRTY'}**\n",
                       "\n### `az container show` (specific check)\n",
                       f"exit code: `{show.returncode}`\n\n",
-                      "```\n" + (show.stderr or show.stdout or "<no output>") + "\n```\n",
+                      "```\n" + scrub(show.stderr or show.stdout or "<no output>") + "\n```\n",
                       "\n### `az container list` (general check)\n",
                       f"exit code: `{listing.returncode}`\n\n",
-                      "```\n" + (listing.stdout or listing.stderr or "<no output>") + "\n```\n",
+                      "```\n" + scrub(listing.stdout or listing.stderr or "<no output>") + "\n```\n",
                   ]
                   write_summary("".join(summary_lines))
 
@@ -846,12 +884,12 @@ jobs:
                   if not show_clean:
                       details.append(
                           f"container show for {group_name!r} did not confirm absence "
-                          f"(exit {show.returncode}): {show.stdout or show.stderr}"
+                          f"(exit {show.returncode}): {scrub(show.stdout or show.stderr)}"
                       )
                   if not list_clean:
                       details.append(
                           f"container list is not empty (exit {listing.returncode}): "
-                          f"{remaining if remaining is not None else listing.stdout or listing.stderr}"
+                          f"{scrub(json.dumps(remaining) if remaining is not None else (listing.stdout or listing.stderr))}"
                       )
                   print(
                       "teardown-verify: DIRTY -- " + "; ".join(details),
