@@ -18,23 +18,42 @@ jobs:
       - name: Evaluate CAP-16 deployment preflight
         env:
           CAP16_PREFLIGHT_BASE_URL: ${{ vars.CAP16_PREFLIGHT_BASE_URL }}
+          CAP16_PREFLIGHT_OIDC_AUDIENCE: ${{ vars.CAP16_PREFLIGHT_OIDC_AUDIENCE }}
           CAP16_TENANT_ID: ${{ vars.CAP16_TENANT_ID }}
           CAP16_PREFLIGHT_CANDIDATE_JSON: ${{ vars.CAP16_PREFLIGHT_CANDIDATE_JSON }}
           CAP16_ENVIRONMENT_LABEL: epic46-preflight-demo
-          CAP16_WORKFLOW_FILE: cap16-preflight.yml
         run: |
           python3 - <<'PYEOF'
           """Story 76.2. Inline, stdlib-only re-implementation of the minimal subset of
-          ../../.github/actions/deployment-preflight/preflight.py's logic this story's AC
-          actually requires: mint a fresh GitHub OIDC token, assemble the DeploymentCandidateV1
-          candidate, POST it to Registry's real preflight route, and branch on the HTTP status
-          code alone. Deliberately does NOT reimplement that script's client-side JWS/Ed25519
-          receipt verification -- see Story 76.2 Dev Notes "Why not just `uses:` the real
-          composite action": the server's own route contract guarantees HTTP 200 is returned
-          if and only if the result is a genuinely fresh, signed ELIGIBLE receipt (every other
-          outcome -- INELIGIBLE/INDETERMINATE/STALE/unauthenticated/unconfigured -- is a
-          distinct non-200 status), so checking the status code alone already satisfies this
-          story's AC1 "unexpired signed ELIGIBLE result" gate.
+          praitor's own .github/actions/deployment-preflight/preflight.py this story's AC
+          requires: mint a fresh GitHub OIDC token, assemble the DeploymentCandidateV1
+          candidate, POST it to Registry's real preflight route, and gate the next step on the
+          result.
+
+          Deliberately does NOT reimplement that script's Ed25519 signature verification of the
+          returned receipt (that needs `cryptography`, which is not stdlib). Post-security-review
+          fix pass, Story 76.2: the FIRST version of this file additionally omitted that script's
+          own H1/M3/M6 fixes, which ARE reproducible with the stdlib and are reproduced here:
+
+            H1  no redirect is ever followed (_OPENER below). urllib's default opener copies the
+                Authorization header verbatim to an arbitrary redirect target (verified on
+                CPython 3.12: HTTPRedirectHandler.redirect_request strips only content-length
+                and content-type), so a redirect on either request would hand a live GitHub OIDC
+                bearer token to a third-party host -- and a redirect on the POST would also let
+                that host answer the `200` this script gates the deploy step on.
+            M3  the base URL must be https:// (a plaintext base URL is a silent fail-open that
+                does not even need a redirect).
+            M6  the OIDC `aud` is NOT the route's `_AUDIENCE` constant. That constant
+                ("cap16-deployment-preflight-v1") is the route's PDP caller-identity provenance
+                label -- the route's own source says so -- while the token's `aud` must equal the
+                Registry deployment's configured CAP16_GITHUB_OIDC_AUDIENCE. It is therefore a
+                required repo variable here, with no default.
+
+          The residual, disclosed ceiling versus the real composite action: this script trusts
+          `HTTP 200 + a structurally ELIGIBLE receipt carrying a compact_jws` rather than
+          verifying that receipt's Ed25519 signature. Switching this workflow to
+          `uses: rstdevlab/praitor/.github/actions/deployment-preflight@<sha>` once cross-repo
+          action access is resolved remains the recorded forward note (Story 76.2 Dev Notes).
           """
           import hashlib
           import json
@@ -46,27 +65,31 @@ jobs:
 
           SCHEMA_ID = "praitor.deployment-preflight-request.v1"
           ROUTE = "/v1/cap16/deployments/preflight"
-          # The route's own OIDC audience constant (`_AUDIENCE` in
-          # api/cap16_deployment_preflight.py) -- a caller-identity provenance label passed to
-          # the PDP basis, distinct from every other CAP-16 audience this codebase mints.
-          AUDIENCE = "cap16-deployment-preflight-v1"
 
 
           class PreflightFailed(Exception):
               """Any failure mode this script exits nonzero for."""
 
 
-          def env(name, *, required=True):
+          class _NoRedirect(urllib.request.HTTPRedirectHandler):
+              """H1: refuse a redirect outright rather than silently following it."""
+
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise PreflightFailed(f"refusing to follow a redirect to {newurl!r}")
+
+
+          _OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+          def env(name):
               value = os.environ.get(name)
-              if required and not value:
+              if not value:
                   raise PreflightFailed(f"required environment variable {name} is not set")
               return value
 
 
           def mint_oidc_token(audience):
-              """GitHub's own documented mechanism -- no external action dependency, matching
-              the composite action's own `_mint_oidc_token` and the style reference
-              (registry-enrollment.yml)'s raw curl-equivalent pattern."""
+              """GitHub's own documented mechanism -- no external action dependency."""
               request_url = env("ACTIONS_ID_TOKEN_REQUEST_URL")
               request_token = env("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
               sep = "&" if "?" in request_url else "?"
@@ -74,7 +97,7 @@ jobs:
               req = urllib.request.Request(
                   url, headers={"Authorization": f"Bearer {request_token}"}
               )
-              with urllib.request.urlopen(req, timeout=15.0) as resp:  # noqa: S310
+              with _OPENER.open(req, timeout=15.0) as resp:  # noqa: S310
                   body = json.loads(resp.read())
               token = body.get("value")
               if not token:
@@ -83,40 +106,41 @@ jobs:
 
 
           def compute_client_request_digest(candidate_without_digest):
-              """`client_request_digest` MUST be a well-formed Cap16DigestHex
-              (`^[0-9a-f]{64}$`), but Story 76.2 Task 1.2's own research finding
-              (components/registry/src/agent_registry/domain/errors.py, ReasonCode's own
-              CAP16_DEPLOYMENT_WORKFLOW_REPORT_INVALID comment: "Story 44.8's own
-              client_request_digest is caller-supplied but never actually cross-checked against
-              anything") is that this route neither recomputes nor compares it against anything
-              -- so a real SHA-256 hex digest over the assembled candidate (json.dumps with
-              sorted keys, NOT RFC 8785 JCS canonicalization -- deliberately not reproduced here
-              since nothing server-side verifies it) is sufficient: well-formed, genuinely
-              computed, never a fabricated-looking placeholder digest. A future story that makes
-              this route verify the field would need a real JCS implementation instead."""
+              """`client_request_digest` MUST be a well-formed Cap16DigestHex (`^[0-9a-f]{64}$`),
+              but Story 76.2 Task 1.2's research finding (agent_registry/domain/errors.py's own
+              ReasonCode comment: "Story 44.8's own client_request_digest is caller-supplied but
+              never actually cross-checked against anything") is that THIS route neither
+              recomputes nor compares it -- so a real SHA-256 over the assembled candidate
+              (sorted-key JSON, NOT RFC 8785 JCS, deliberately not reproduced since nothing
+              server-side verifies it) is sufficient: well-formed and genuinely computed, never a
+              fabricated placeholder. A future story that makes this route verify the field would
+              need a real JCS implementation instead."""
               canonical = json.dumps(candidate_without_digest, sort_keys=True, separators=(",", ":"))
               return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
           def build_candidate():
               extra = json.loads(env("CAP16_PREFLIGHT_CANDIDATE_JSON"))
-              repository = env("GITHUB_REPOSITORY")
-              workflow_ref = env("GITHUB_REF")
               run_id = env("GITHUB_RUN_ID")
               run_attempt = env("GITHUB_RUN_ATTEMPT")
               operation_id = f"{run_id}-{run_attempt}"
               candidate = {
+                  # Post-security-review fix pass: the configurable blob is merged FIRST, so the
+                  # runtime-derived identity fields below always win. The original ordering
+                  # (`**extra` last) let a repository variable silently override
+                  # action_distribution_ref / github_environment_label / git_sha / tenant_id.
+                  **extra,
                   "schema_id": SCHEMA_ID,
                   "tenant_id": env("CAP16_TENANT_ID"),
                   "operation_id": operation_id,
                   "idempotency_key": operation_id,
-                  "action_distribution_ref": (
-                      f"{repository}/.github/workflows/{env('CAP16_WORKFLOW_FILE')}"
-                      f"@{workflow_ref}"
-                  ),
+                  # GITHUB_WORKFLOW_REF is a default runner variable carrying exactly the
+                  # `owner/repo/.github/workflows/<file>@<ref>` shape the server compares against
+                  # the verified OIDC `workflow_ref` claim -- used verbatim rather than
+                  # hand-reconstructed from a hardcoded filename that a rename would desync.
+                  "action_distribution_ref": env("GITHUB_WORKFLOW_REF"),
                   "git_sha": env("GITHUB_SHA"),
                   "github_environment_label": env("CAP16_ENVIRONMENT_LABEL"),
-                  **extra,
               }
               candidate["client_request_digest"] = compute_client_request_digest(candidate)
               return candidate
@@ -125,10 +149,11 @@ jobs:
           def main():
               try:
                   base_url = env("CAP16_PREFLIGHT_BASE_URL").rstrip("/")
-                  if not base_url.startswith("https://"):
+                  if not base_url.startswith("https://"):  # M3
                       raise PreflightFailed("CAP16_PREFLIGHT_BASE_URL must be an https:// URL")
+                  audience = env("CAP16_PREFLIGHT_OIDC_AUDIENCE")  # M6 -- no default
 
-                  token = mint_oidc_token(AUDIENCE)
+                  token = mint_oidc_token(audience)
                   print("::add-mask::" + token)
 
                   candidate = build_candidate()
@@ -142,22 +167,37 @@ jobs:
                       },
                   )
                   try:
-                      with urllib.request.urlopen(request, timeout=30.0) as response:  # noqa: S310
+                      with _OPENER.open(request, timeout=30.0) as response:  # noqa: S310
                           status_code = response.status
-                          response_body = response.read().decode("utf-8", errors="replace")
+                          raw = response.read().decode("utf-8", errors="replace")
                   except urllib.error.HTTPError as exc:
                       status_code = exc.code
-                      response_body = exc.read().decode("utf-8", errors="replace")
+                      raw = exc.read().decode("utf-8", errors="replace")
 
                   if status_code != 200:
-                      print(
-                          f"deployment-preflight: REFUSED -- HTTP {status_code}: "
-                          f"{response_body[:2000]}",
-                          file=sys.stderr,
-                      )
-                      return 1
+                      # Only the RFC 9457 reason_code/title is echoed -- never the whole body,
+                      # which on a 403/409 carries the full signed receipt (tenant_id,
+                      # agent_uuidv7, every expected_* digest) into this PUBLIC repo's run log.
+                      try:
+                          problem = json.loads(raw)
+                          detail = f"{problem.get('reason_code')} / {problem.get('title')}"
+                      except ValueError:
+                          detail = "<non-JSON response body, withheld>"
+                      raise PreflightFailed(f"HTTP {status_code}: {detail}")
 
-                  print(f"deployment-preflight: ELIGIBLE (HTTP 200): {response_body[:2000]}")
+                  body = json.loads(raw)
+                  if body.get("result") != "ELIGIBLE":
+                      raise PreflightFailed(f"receipt result is {body.get('result')!r}")
+                  if not body.get("compact_jws"):
+                      raise PreflightFailed("receipt carried no compact_jws")
+                  if body.get("operation_id") != candidate["operation_id"]:
+                      raise PreflightFailed("receipt operation_id is not this run's own")
+
+                  # Identifier-free: no tenant_id/agent_uuidv7/digest/JWS reaches the public log.
+                  print(
+                      "deployment-preflight: ELIGIBLE (HTTP 200, signed receipt "
+                      f"{body.get('receipt_id')}, fresh_until {body.get('fresh_until')})"
+                  )
                   return 0
               except PreflightFailed as exc:
                   print(f"deployment-preflight: REFUSED -- {exc}", file=sys.stderr)
