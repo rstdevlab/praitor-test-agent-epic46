@@ -261,6 +261,11 @@ jobs:
           found live in the same run, `az container create --acr-identity <id>` (any identity
           shape) omits `osType` from its generated ARM payload unless `--os-type` is passed
           explicitly, producing a server-side `InvalidOsType` 400 with no client-side warning.
+
+          `--ip-address Public` is also explicit: found live, the first successful create (no
+          error, container reached Running) left `ipAddress` entirely null -- `az container
+          create` does not default to a public IP merely because `--ports` was given, and
+          Task 5.3's own "actually works" HTTP check needs a reachable address.
           """
           import json
           import os
@@ -399,6 +404,8 @@ jobs:
                           "8080",
                           "--os-type",
                           "Linux",
+                          "--ip-address",
+                          "Public",
                           "--restart-policy",
                           "Never",
                           "--assign-identity",
