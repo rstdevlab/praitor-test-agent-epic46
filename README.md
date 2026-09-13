@@ -1,4 +1,4 @@
-# praitor-test-agent
+# praitor-test-agent-epic46
 
 **This repository is disposable and non-production.**
 
@@ -24,6 +24,6 @@ curl http://localhost:8080/
 Build the container image:
 
 ```bash
-docker build -t praitor-test-agent .
-docker run --rm -p 8080:8080 praitor-test-agent
+docker build -t praitor-test-agent-epic46 .
+docker run --rm -p 8080:8080 praitor-test-agent-epic46
 ```
