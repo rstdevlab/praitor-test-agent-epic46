@@ -1,0 +1,174 @@
+name: CAP-16 deployment preflight (Epic 76 disposable target)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  preflight-then-dummy-deploy:
+    runs-on: ubuntu-latest
+    environment: epic46-preflight-demo   # MUST byte-for-byte match the github_environment_label
+                                          # sent below -- a mismatch is a hard 403 server-side
+                                          # (components/registry/src/agent_registry/api/
+                                          # cap16_deployment_preflight.py, Story 76.2 Task 1.1).
+    steps:
+      - name: Evaluate CAP-16 deployment preflight
+        env:
+          CAP16_PREFLIGHT_BASE_URL: ${{ vars.CAP16_PREFLIGHT_BASE_URL }}
+          CAP16_TENANT_ID: ${{ vars.CAP16_TENANT_ID }}
+          CAP16_PREFLIGHT_CANDIDATE_JSON: ${{ vars.CAP16_PREFLIGHT_CANDIDATE_JSON }}
+          CAP16_ENVIRONMENT_LABEL: epic46-preflight-demo
+          CAP16_WORKFLOW_FILE: cap16-preflight.yml
+        run: |
+          python3 - <<'PYEOF'
+          """Story 76.2. Inline, stdlib-only re-implementation of the minimal subset of
+          ../../.github/actions/deployment-preflight/preflight.py's logic this story's AC
+          actually requires: mint a fresh GitHub OIDC token, assemble the DeploymentCandidateV1
+          candidate, POST it to Registry's real preflight route, and branch on the HTTP status
+          code alone. Deliberately does NOT reimplement that script's client-side JWS/Ed25519
+          receipt verification -- see Story 76.2 Dev Notes "Why not just `uses:` the real
+          composite action": the server's own route contract guarantees HTTP 200 is returned
+          if and only if the result is a genuinely fresh, signed ELIGIBLE receipt (every other
+          outcome -- INELIGIBLE/INDETERMINATE/STALE/unauthenticated/unconfigured -- is a
+          distinct non-200 status), so checking the status code alone already satisfies this
+          story's AC1 "unexpired signed ELIGIBLE result" gate.
+          """
+          import hashlib
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          SCHEMA_ID = "praitor.deployment-preflight-request.v1"
+          ROUTE = "/v1/cap16/deployments/preflight"
+          # The route's own OIDC audience constant (`_AUDIENCE` in
+          # api/cap16_deployment_preflight.py) -- a caller-identity provenance label passed to
+          # the PDP basis, distinct from every other CAP-16 audience this codebase mints.
+          AUDIENCE = "cap16-deployment-preflight-v1"
+
+
+          class PreflightFailed(Exception):
+              """Any failure mode this script exits nonzero for."""
+
+
+          def env(name, *, required=True):
+              value = os.environ.get(name)
+              if required and not value:
+                  raise PreflightFailed(f"required environment variable {name} is not set")
+              return value
+
+
+          def mint_oidc_token(audience):
+              """GitHub's own documented mechanism -- no external action dependency, matching
+              the composite action's own `_mint_oidc_token` and the style reference
+              (registry-enrollment.yml)'s raw curl-equivalent pattern."""
+              request_url = env("ACTIONS_ID_TOKEN_REQUEST_URL")
+              request_token = env("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+              sep = "&" if "?" in request_url else "?"
+              url = f"{request_url}{sep}audience={urllib.parse.quote(audience)}"
+              req = urllib.request.Request(
+                  url, headers={"Authorization": f"Bearer {request_token}"}
+              )
+              with urllib.request.urlopen(req, timeout=15.0) as resp:  # noqa: S310
+                  body = json.loads(resp.read())
+              token = body.get("value")
+              if not token:
+                  raise PreflightFailed("OIDC token minting response carried no 'value' field")
+              return str(token)
+
+
+          def compute_client_request_digest(candidate_without_digest):
+              """`client_request_digest` MUST be a well-formed Cap16DigestHex
+              (`^[0-9a-f]{64}$`), but Story 76.2 Task 1.2's own research finding
+              (components/registry/src/agent_registry/domain/errors.py, ReasonCode's own
+              CAP16_DEPLOYMENT_WORKFLOW_REPORT_INVALID comment: "Story 44.8's own
+              client_request_digest is caller-supplied but never actually cross-checked against
+              anything") is that this route neither recomputes nor compares it against anything
+              -- so a real SHA-256 hex digest over the assembled candidate (json.dumps with
+              sorted keys, NOT RFC 8785 JCS canonicalization -- deliberately not reproduced here
+              since nothing server-side verifies it) is sufficient: well-formed, genuinely
+              computed, never a fabricated-looking placeholder digest. A future story that makes
+              this route verify the field would need a real JCS implementation instead."""
+              canonical = json.dumps(candidate_without_digest, sort_keys=True, separators=(",", ":"))
+              return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+          def build_candidate():
+              extra = json.loads(env("CAP16_PREFLIGHT_CANDIDATE_JSON"))
+              repository = env("GITHUB_REPOSITORY")
+              workflow_ref = env("GITHUB_REF")
+              run_id = env("GITHUB_RUN_ID")
+              run_attempt = env("GITHUB_RUN_ATTEMPT")
+              operation_id = f"{run_id}-{run_attempt}"
+              candidate = {
+                  "schema_id": SCHEMA_ID,
+                  "tenant_id": env("CAP16_TENANT_ID"),
+                  "operation_id": operation_id,
+                  "idempotency_key": operation_id,
+                  "action_distribution_ref": (
+                      f"{repository}/.github/workflows/{env('CAP16_WORKFLOW_FILE')}"
+                      f"@{workflow_ref}"
+                  ),
+                  "git_sha": env("GITHUB_SHA"),
+                  "github_environment_label": env("CAP16_ENVIRONMENT_LABEL"),
+                  **extra,
+              }
+              candidate["client_request_digest"] = compute_client_request_digest(candidate)
+              return candidate
+
+
+          def main():
+              try:
+                  base_url = env("CAP16_PREFLIGHT_BASE_URL").rstrip("/")
+                  if not base_url.startswith("https://"):
+                      raise PreflightFailed("CAP16_PREFLIGHT_BASE_URL must be an https:// URL")
+
+                  token = mint_oidc_token(AUDIENCE)
+                  print("::add-mask::" + token)
+
+                  candidate = build_candidate()
+                  request = urllib.request.Request(  # noqa: S310
+                      f"{base_url}{ROUTE}",
+                      data=json.dumps(candidate).encode("utf-8"),
+                      method="POST",
+                      headers={
+                          "Authorization": f"Bearer {token}",
+                          "Content-Type": "application/json",
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=30.0) as response:  # noqa: S310
+                          status_code = response.status
+                          response_body = response.read().decode("utf-8", errors="replace")
+                  except urllib.error.HTTPError as exc:
+                      status_code = exc.code
+                      response_body = exc.read().decode("utf-8", errors="replace")
+
+                  if status_code != 200:
+                      print(
+                          f"deployment-preflight: REFUSED -- HTTP {status_code}: "
+                          f"{response_body[:2000]}",
+                          file=sys.stderr,
+                      )
+                      return 1
+
+                  print(f"deployment-preflight: ELIGIBLE (HTTP 200): {response_body[:2000]}")
+                  return 0
+              except PreflightFailed as exc:
+                  print(f"deployment-preflight: REFUSED -- {exc}", file=sys.stderr)
+                  return 1
+              except Exception as exc:  # noqa: BLE001 - fail closed on ANY unexpected error
+                  print(f"deployment-preflight: REFUSED -- unexpected error: {exc}", file=sys.stderr)
+                  return 1
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+      - name: Dummy deploy step (placeholder for Story 76.3's real Azure deploy)
+        run: echo "would deploy here -- preflight ELIGIBLE, proceeding"
