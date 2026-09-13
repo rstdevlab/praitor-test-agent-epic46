@@ -11,6 +11,12 @@ jobs:
   verify-azure-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: epic46-preflight-demo   # MUST match the federated credential's own subject
+                                          # (repo:OWNER/REPO:environment:epic46-preflight-demo,
+                                          # Task 2.4) -- omitting this makes GitHub mint a
+                                          # branch-scoped subject instead, which the credential
+                                          # does not recognize (found live, this story's first
+                                          # dispatch attempt: AADSTS700213).
     steps:
       - name: Dummy deploy step -- real disposable Azure Container Instance (Story 76.3)
         env:
