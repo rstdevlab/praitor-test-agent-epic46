@@ -10,6 +10,9 @@ permissions:
 jobs:
   preflight-then-dummy-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # code-review LOW-3, Story 76.2: both HTTP requests already carry their
+                           # own timeouts (15s/30s); this bounds the whole job against a hang
+                           # elsewhere, instead of the 360-minute runner default.
     environment: epic46-preflight-demo   # MUST byte-for-byte match the github_environment_label
                                           # sent below -- a mismatch is a hard 403 server-side
                                           # (components/registry/src/agent_registry/api/
