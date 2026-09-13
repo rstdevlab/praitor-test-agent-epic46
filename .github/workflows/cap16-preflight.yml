@@ -505,6 +505,7 @@ jobs:
           AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
         run: |
           python3 - <<'PYEOF'
           """Story 76.5. Inline, stdlib-only teardown step: mints its OWN fresh OIDC
@@ -527,6 +528,16 @@ jobs:
           DELETE). So this step does not need to distinguish "already absent" from
           "just deleted" -- a single delete call, treated as fail-closed on any nonzero
           exit, correctly satisfies AC1 either way.
+
+          Post-review fix (code-review MEDIUM-1 / security-review H1): the deploy step
+          also pushes a uniquely-tagged ACR image per run -- that image lives inside this
+          same scoped resource group's ACR and is "another resource this run created"
+          under AC1, so it must be torn down here too. UNLIKE `az container delete`,
+          `az acr repository delete --image` is NOT idempotent -- confirmed live, it
+          exits 1 with "the specified tag does not exist" on an already-absent image
+          (e.g. the denied-preflight branch, where the deploy step never ran and no
+          image was ever pushed). That exact, checked message is therefore also a
+          correct/expected outcome here, not a failure -- see `run_allow_missing()`.
           """
           import json
           import os
@@ -579,6 +590,13 @@ jobs:
               return f"epic46-test-agent-{run_id}-{run_attempt}"
 
 
+          def image_repo_tag(run_id, run_attempt):
+              # `az acr repository delete --image` wants "repository:tag", never the
+              # registry-qualified form the deploy step's own image_tag() builds for
+              # `docker push`. MUST stay byte-identical in the repository/tag parts.
+              return f"praitor-test-agent-epic46:{run_id}-{run_attempt}"
+
+
           def run(cmd, secrets=(), quiet=False):
               echoed = ["***" if part in secrets else part for part in cmd]
               printable = "+ " + " ".join(echoed)
@@ -595,12 +613,35 @@ jobs:
                   ) from exc
 
 
+          def run_allow_missing(cmd, secrets=(), missing_text=""):
+              """Like `run()`, but a nonzero exit whose stderr contains `missing_text`
+              is treated as success (the "already absent" outcome), not a failure --
+              needed because `az acr repository delete` is NOT idempotent the way
+              `az container delete` is (verified live, see module docstring)."""
+              echoed = ["***" if part in secrets else part for part in cmd]
+              printable = "+ " + " ".join(echoed)
+              print(printable)
+              result = subprocess.run(  # noqa: S603
+                  cmd, capture_output=True, text=True
+              )
+              if result.returncode == 0:
+                  return
+              if missing_text in (result.stderr or ""):
+                  print(f"  (already absent -- {missing_text!r} confirmed in stderr)")
+                  return
+              raise TeardownFailed(
+                  f"command exited {result.returncode}: {printable}: "
+                  f"{(result.stderr or result.stdout or '').strip()}"
+              )
+
+
           def main():
               try:
                   client_id = env("AZURE_CLIENT_ID")
                   tenant_id = env("AZURE_TENANT_ID")
                   subscription_id = env("AZURE_SUBSCRIPTION_ID")
                   resource_group = env("AZURE_RESOURCE_GROUP")
+                  acr_name = env("AZURE_ACR_NAME")
                   run_id = env("GITHUB_RUN_ID")
                   run_attempt = env("GITHUB_RUN_ATTEMPT")
 
@@ -647,6 +688,26 @@ jobs:
                       f"{group_name!r} in {resource_group!r} (idempotent -- absent-or-"
                       "present both succeed at HTTP 204/exit 0)"
                   )
+
+                  repo_tag = image_repo_tag(run_id, run_attempt)
+                  run_allow_missing(
+                      [
+                          "az",
+                          "acr",
+                          "repository",
+                          "delete",
+                          "--name",
+                          acr_name,
+                          "--image",
+                          repo_tag,
+                          "--yes",
+                      ],
+                      missing_text="the specified tag does not exist",
+                  )
+                  print(
+                      f"teardown: ACR image {repo_tag!r} deleted (or already absent) "
+                      f"in {acr_name!r}"
+                  )
                   return 0
               except TeardownFailed as exc:
                   print(f"teardown: FAILED -- {exc}", file=sys.stderr)
@@ -666,6 +727,7 @@ jobs:
           AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
         run: |
           python3 - <<'PYEOF'
           """Story 76.5. Independent verification step -- AC2's own evidence artifact.
@@ -675,16 +737,22 @@ jobs:
           somehow failed (`if: always()`), so a failed teardown is independently
           observed rather than silently skipped.
 
-          Two checks, both via `az container` (never `az resource list` -- Dev Notes
-          "Why `az container list`, not `az resource list`"):
+          Three checks, `az container show`/`az container list` plus an ACR tag check
+          (post-review fix, code-review MEDIUM-1/security-review H1 -- the general
+          container-group checks alone reported CLEAN while this run's own ACR image
+          tag survived; never a resource this run created, per AC1, going unverified):
             (a) SPECIFIC: `az container show` for this run's own group name. Verified
                 live (Task 3.5/4.3 probe, recorded in Dev Agent Record): a GET on an
                 absent container group exits nonzero with a message containing
                 "ResourceNotFound" -- that IS the expected/CLEAN outcome here (unlike
                 the teardown step's own idempotent DELETE, which never surfaces this).
             (b) GENERAL: `az container list` for the whole resource group, expect `[]`.
+            (c) SPECIFIC: `az acr repository show-tags` for the one repository, expect
+                this run's own tag (`{run_id}-{run_attempt}`) absent from the list --
+                never a raw exit-code check, since `show-tags` on a still-existing
+                repository with OTHER tags exits 0 either way.
 
-          Evidence (both raw outputs) is written to $GITHUB_STEP_SUMMARY -- a native
+          Evidence (raw outputs) is written to $GITHUB_STEP_SUMMARY -- a native
           runner feature needing no `uses:` entry -- per Dev Notes "Why
           $GITHUB_STEP_SUMMARY, not an uploaded artifact".
           """
@@ -801,9 +869,11 @@ jobs:
                   tenant_id = env("AZURE_TENANT_ID")
                   subscription_id = env("AZURE_SUBSCRIPTION_ID")
                   resource_group = env("AZURE_RESOURCE_GROUP")
+                  acr_name = env("AZURE_ACR_NAME")
                   run_id = env("GITHUB_RUN_ID")
                   run_attempt = env("GITHUB_RUN_ATTEMPT")
                   group_name = container_group_name(run_id, run_attempt)
+                  expected_tag = f"{run_id}-{run_attempt}"
 
                   token = mint_oidc_token(AZURE_OIDC_AUDIENCE)
                   print("::add-mask::" + token)
@@ -856,13 +926,44 @@ jobs:
                       remaining = None
                   list_clean = listing.returncode == 0 and remaining == []
 
-                  clean = show_clean and list_clean
+                  tags = run_capture(
+                      [
+                          "az",
+                          "acr",
+                          "repository",
+                          "show-tags",
+                          "--name",
+                          acr_name,
+                          "--repository",
+                          "praitor-test-agent-epic46",
+                          "-o",
+                          "json",
+                      ]
+                  )
+                  # A nonzero exit whose stderr confirms the repository itself doesn't
+                  # exist (verified live -- "... is not found") is ALSO clean: no
+                  # repository means no tag list to check, trivially satisfying
+                  # "this run's tag is absent." Any OTHER nonzero exit (auth failure,
+                  # throttling, ...) stays fail-closed/inconclusive, same posture as
+                  # `list_clean` above.
+                  repo_missing = tags.returncode != 0 and "is not found" in (tags.stderr or "")
+                  try:
+                      existing_tags = json.loads(tags.stdout) if tags.returncode == 0 else []
+                  except ValueError:
+                      existing_tags = None
+                  if repo_missing:
+                      tag_clean = True
+                  else:
+                      tag_clean = existing_tags is not None and expected_tag not in existing_tags
+
+                  clean = show_clean and list_clean and tag_clean
 
                   summary_lines = [
                       "## Story 76.5 -- independent teardown verification\n",
                       f"- run: `{run_id}-{run_attempt}`\n",
                       f"- resource group: `{resource_group}`\n",
                       f"- expected container group: `{group_name}`\n",
+                      f"- expected ACR tag (must be absent): `{expected_tag}`\n",
                       f"- result: **{'CLEAN' if clean else 'DIRTY'}**\n",
                       "\n### `az container show` (specific check)\n",
                       f"exit code: `{show.returncode}`\n\n",
@@ -870,13 +971,17 @@ jobs:
                       "\n### `az container list` (general check)\n",
                       f"exit code: `{listing.returncode}`\n\n",
                       "```\n" + scrub(listing.stdout or listing.stderr or "<no output>") + "\n```\n",
+                      "\n### `az acr repository show-tags` (ACR image check)\n",
+                      f"exit code: `{tags.returncode}`\n\n",
+                      "```\n" + scrub(tags.stdout or tags.stderr or "<no output>") + "\n```\n",
                   ]
                   write_summary("".join(summary_lines))
 
                   if clean:
                       print(
                           "teardown-verify: CLEAN (no resources for run "
-                          f"{run_id}-{run_attempt} in {resource_group})"
+                          f"{run_id}-{run_attempt} in {resource_group}, ACR tag "
+                          f"{expected_tag!r} absent)"
                       )
                       return 0
 
@@ -890,6 +995,12 @@ jobs:
                       details.append(
                           f"container list is not empty (exit {listing.returncode}): "
                           f"{scrub(json.dumps(remaining) if remaining is not None else (listing.stdout or listing.stderr))}"
+                      )
+                  if not tag_clean:
+                      details.append(
+                          f"ACR tag {expected_tag!r} still present or tag list unreadable "
+                          f"(exit {tags.returncode}): "
+                          f"{scrub(json.dumps(existing_tags) if existing_tags is not None else (tags.stdout or tags.stderr))}"
                       )
                   print(
                       "teardown-verify: DIRTY -- " + "; ".join(details),
