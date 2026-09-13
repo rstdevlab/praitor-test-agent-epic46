@@ -61,6 +61,11 @@ jobs:
           resolves it -- while preserving the exact same property AC1/Dev Notes "No ACR
           admin credentials" required: no stored/long-lived credential, only a managed
           identity attached at create time.
+
+          `--os-type Linux` is likewise explicit rather than left to its documented default:
+          found live in the same run, `az container create --acr-identity <id>` (any identity
+          shape) omits `osType` from its generated ARM payload unless `--os-type` is passed
+          explicitly, producing a server-side `InvalidOsType` 400 with no client-side warning.
           """
           import json
           import os
@@ -197,6 +202,8 @@ jobs:
                           "1",
                           "--ports",
                           "8080",
+                          "--os-type",
+                          "Linux",
                           "--restart-policy",
                           "Never",
                           "--assign-identity",
