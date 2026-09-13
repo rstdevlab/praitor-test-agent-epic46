@@ -328,18 +328,37 @@ jobs:
                   raise DeployFailed(f"failed to fetch {url}: HTTP {exc.code}")
 
 
-          def container_group_name(run_id):
-              # Task 3.2e: unique per run so repeated/parallel runs never collide.
-              return f"epic46-test-agent-{run_id}"
+          def container_group_name(run_id, run_attempt):
+              # 1f fix (LOW-1): run_id ALONE repeats verbatim across a job re-run (a re-run
+              # reuses the same GITHUB_RUN_ID) -- fold in run_attempt too, same as the
+              # preflight step's own operation_id, so a re-run never collides.
+              return f"epic46-test-agent-{run_id}-{run_attempt}"
 
 
-          def image_tag(acr_name, run_id):
-              return f"{acr_name}.azurecr.io/praitor-test-agent-epic46:{run_id}"
+          def image_tag(acr_name, run_id, run_attempt):
+              return f"{acr_name}.azurecr.io/praitor-test-agent-epic46:{run_id}-{run_attempt}"
 
 
-          def run(cmd):
-              print("+ " + " ".join(cmd))
-              subprocess.run(cmd, check=True)  # noqa: S603
+          def run(cmd, secrets=(), quiet=False):
+              # 1f fix (LOW-2/S3): redact any argv element named in `secrets` (e.g. the live
+              # OIDC-exchanged bearer token) from the echoed command line -- `::add-mask::`
+              # already protects it, but the value should never be *printed* at all, not
+              # rely on a single masking mechanism in a public repo's run log.
+              echoed = ["***" if part in secrets else part for part in cmd]
+              printable = "+ " + " ".join(echoed)
+              print(printable)
+              try:
+                  subprocess.run(  # noqa: S603
+                      cmd,
+                      check=True,
+                      stdout=subprocess.DEVNULL if quiet else None,
+                  )
+              except subprocess.CalledProcessError as exc:
+                  # 1f fix (LOW-2/S3): raise with the REDACTED command, never exc.cmd
+                  # verbatim -- exc.cmd carries the real secret value.
+                  raise DeployFailed(
+                      f"command exited {exc.returncode}: {printable}"
+                  ) from exc
 
 
           def main():
@@ -353,6 +372,7 @@ jobs:
                   repo = env("GITHUB_REPOSITORY")
                   sha = env("GITHUB_SHA")
                   run_id = env("GITHUB_RUN_ID")
+                  run_attempt = env("GITHUB_RUN_ATTEMPT")
 
                   token = mint_oidc_token(AZURE_OIDC_AUDIENCE)
                   print("::add-mask::" + token)
@@ -368,9 +388,16 @@ jobs:
                           tenant_id,
                           "--federated-token",
                           token,
-                      ]
+                      ],
+                      secrets=(token,),
+                      # 1f fix (S2): az login's own JSON response enumerates every
+                      # subscription/tenant this SP can see -- not needed downstream.
+                      quiet=True,
                   )
-                  run(["az", "account", "set", "--subscription", subscription_id])
+                  run(
+                      ["az", "account", "set", "--subscription", subscription_id],
+                      quiet=True,
+                  )
 
                   workdir = "epic46-deploy-build"
                   os.makedirs(workdir, exist_ok=True)
@@ -379,12 +406,12 @@ jobs:
                       with open(os.path.join(workdir, name), "wb") as fh:
                           fh.write(content)
 
-                  tag = image_tag(acr_name, run_id)
+                  tag = image_tag(acr_name, run_id, run_attempt)
                   run(["docker", "build", "-t", tag, workdir])
-                  run(["az", "acr", "login", "--name", acr_name])
+                  run(["az", "acr", "login", "--name", acr_name], quiet=True)
                   run(["docker", "push", tag])
 
-                  group_name = container_group_name(run_id)
+                  group_name = container_group_name(run_id, run_attempt)
                   run(
                       [
                           "az",
@@ -412,7 +439,17 @@ jobs:
                           pull_identity_id,
                           "--acr-identity",
                           pull_identity_id,
-                      ]
+                          "--tags",
+                          "environment=non-production",
+                          "purpose=epic76-disposable-test-agent",
+                          "epic=76",
+                          f"run_id={run_id}",
+                      ],
+                      # 1f fix (S2): the create response's ARM object dumps subscription
+                      # id, tenant id, managed-identity client/principal ids, ACR login
+                      # server, and the public IP into this PUBLIC repo's run log; none
+                      # of it is needed downstream (the group name is already known).
+                      quiet=True,
                   )
 
                   print(
@@ -421,13 +458,12 @@ jobs:
                   )
                   return 0
               except DeployFailed as exc:
+                  # 1f fix (LOW-2/S3): run() now converts every CalledProcessError into a
+                  # DeployFailed carrying the REDACTED command line -- a dedicated
+                  # `except subprocess.CalledProcessError` branch here would echo
+                  # exc.cmd verbatim (the real token), so it's removed rather than kept
+                  # as unreachable dead code that traps a future direct subprocess.run().
                   print(f"deploy: FAILED -- {exc}", file=sys.stderr)
-                  return 1
-              except subprocess.CalledProcessError as exc:
-                  print(
-                      f"deploy: FAILED -- command exited {exc.returncode}: {exc.cmd}",
-                      file=sys.stderr,
-                  )
                   return 1
               except Exception as exc:  # noqa: BLE001 - fail closed on ANY unexpected error
                   print(f"deploy: FAILED -- unexpected error: {exc}", file=sys.stderr)
