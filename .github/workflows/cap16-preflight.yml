@@ -220,6 +220,7 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_ACI_PULL_IDENTITY_ID: ${{ vars.AZURE_ACI_PULL_IDENTITY_ID }}
         run: |
           python3 - <<'PYEOF'
           """Story 76.3. Inline, stdlib-only extension of the dummy-deploy step: mint a
@@ -239,6 +240,22 @@ jobs:
           REST API or the OCI registry push protocol in stdlib Python -- unlike the OIDC
           mint and raw-fetch HTTP calls, which stay urllib-only per the preflight step's
           own H1 (never follow a redirect) precedent.
+
+          Pull-side identity is a pre-created USER-assigned managed identity
+          (AZURE_ACI_PULL_IDENTITY_ID), not the system-assigned '[system]' shortcut the
+          story's own Dev Notes originally described. Found live during this story's own
+          verification run: `az container create --assign-identity '[system]'
+          --acr-identity '[system]'` in a single call hits a real, documented az-cli/ARM
+          ordering limitation -- the container group's system-assigned identity does not
+          exist yet at the point the CLI tries to resolve `--acr-identity`, so it 404s
+          looking up a resource literally named "[system]" under
+          Microsoft.ManagedIdentity/userAssignedIdentities. A pre-created, pre-authorized
+          (AcrPull granted ahead of time by the durable local session, same as the
+          workflow's own AcrPush/ACI-Contributor grants) user-assigned identity sidesteps
+          the ordering problem entirely -- the identity already exists when this call
+          resolves it -- while preserving the exact same property AC1/Dev Notes "No ACR
+          admin credentials" required: no stored/long-lived credential, only a managed
+          identity attached at create time.
           """
           import json
           import os
@@ -322,6 +339,7 @@ jobs:
                   subscription_id = env("AZURE_SUBSCRIPTION_ID")
                   acr_name = env("AZURE_ACR_NAME")
                   resource_group = env("AZURE_RESOURCE_GROUP")
+                  pull_identity_id = env("AZURE_ACI_PULL_IDENTITY_ID")
                   repo = env("GITHUB_REPOSITORY")
                   sha = env("GITHUB_SHA")
                   run_id = env("GITHUB_RUN_ID")
@@ -377,9 +395,9 @@ jobs:
                           "--restart-policy",
                           "Never",
                           "--assign-identity",
-                          "[system]",
+                          pull_identity_id,
                           "--acr-identity",
-                          "[system]",
+                          pull_identity_id,
                       ]
                   )
 
