@@ -11,6 +11,12 @@ jobs:
   deploy-teardown-verify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: epic46-preflight-demo   # load-bearing for the Azure AD federated-credential
+                                          # subject match (repo:.../environment:...), NOT just
+                                          # the CAP16 preflight route's own audience check --
+                                          # found live, Story 76.5's own first Task 6.2 attempt,
+                                          # via a real AADSTS700213 'no matching federated
+                                          # identity record' failure with this line omitted.
     steps:
       - name: Dummy deploy step -- real disposable Azure Container Instance (Story 76.3)
         env:
