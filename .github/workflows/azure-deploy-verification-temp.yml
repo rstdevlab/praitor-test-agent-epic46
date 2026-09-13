@@ -1,0 +1,206 @@
+name: Azure deploy verification (TEMPORARY -- Story 76.3, removed after this story's evidence is captured)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify-azure-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Dummy deploy step -- real disposable Azure Container Instance (Story 76.3)
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          python3 - <<'PYEOF'
+          """Story 76.3. Inline, stdlib-only extension of the dummy-deploy step: mint a
+          SECOND, separately-audienced GitHub OIDC token (api://AzureADTokenExchange, the
+          fixed audience Azure AD federated-credential exchange requires -- distinct from
+          the preflight step's own CAP16_PREFLIGHT_OIDC_AUDIENCE token above), exchange it
+          for an Azure CLI session via `az login --service-principal --federated-token`
+          (no client secret, ever), build/push the test agent's image to the epic's own
+          ACR, and create one disposable, uniquely-suffixed Azure Container Instance
+          running it. Continues Story 76.2's zero-`uses:` design (Dev Notes "Why raw-fetch,
+          not actions/checkout") -- `main.py`/`Dockerfile` are fetched by plain HTTPS GET
+          from raw.githubusercontent.com at this run's own commit SHA, never checked out
+          via a third-party Action.
+
+          `az`/`docker` are both preinstalled on the `ubuntu-latest` runner image; this
+          script shells out to them via subprocess rather than reimplementing the Azure
+          REST API or the OCI registry push protocol in stdlib Python -- unlike the OIDC
+          mint and raw-fetch HTTP calls, which stay urllib-only per the preflight step's
+          own H1 (never follow a redirect) precedent.
+          """
+          import json
+          import os
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          AZURE_OIDC_AUDIENCE = "api://AzureADTokenExchange"
+
+
+          class DeployFailed(Exception):
+              """Any failure mode this script exits nonzero for."""
+
+
+          class _NoRedirect(urllib.request.HTTPRedirectHandler):
+              """Same H1 precedent as the preflight step above: refuse a redirect outright
+              rather than silently following it -- both the OIDC OpenID `Bearer` token and
+              the raw-fetched file contents are sensitive/integrity-relevant enough that a
+              redirect target must never receive them."""
+
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise DeployFailed(f"refusing to follow a redirect to {newurl!r}")
+
+
+          _OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+          def env(name):
+              value = os.environ.get(name)
+              if not value:
+                  raise DeployFailed(f"required environment variable {name} is not set")
+              return value
+
+
+          def mint_oidc_token(audience):
+              request_url = env("ACTIONS_ID_TOKEN_REQUEST_URL")
+              request_token = env("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+              sep = "&" if "?" in request_url else "?"
+              url = f"{request_url}{sep}audience={urllib.parse.quote(audience)}"
+              req = urllib.request.Request(
+                  url, headers={"Authorization": f"Bearer {request_token}"}
+              )
+              with _OPENER.open(req, timeout=15.0) as resp:  # noqa: S310
+                  body = json.loads(resp.read())
+              token = body.get("value")
+              if not token:
+                  raise DeployFailed("OIDC token minting response carried no 'value' field")
+              return str(token)
+
+
+          def fetch_raw(repo, sha, path):
+              url = f"https://raw.githubusercontent.com/{repo}/{sha}/{path}"
+              req = urllib.request.Request(url)  # noqa: S310
+              try:
+                  with _OPENER.open(req, timeout=15.0) as resp:  # noqa: S310
+                      return resp.read()
+              except urllib.error.HTTPError as exc:
+                  raise DeployFailed(f"failed to fetch {url}: HTTP {exc.code}")
+
+
+          def container_group_name(run_id):
+              # Task 3.2e: unique per run so repeated/parallel runs never collide.
+              return f"epic46-test-agent-{run_id}"
+
+
+          def image_tag(acr_name, run_id):
+              return f"{acr_name}.azurecr.io/praitor-test-agent-epic46:{run_id}"
+
+
+          def run(cmd):
+              print("+ " + " ".join(cmd))
+              subprocess.run(cmd, check=True)  # noqa: S603
+
+
+          def main():
+              try:
+                  client_id = env("AZURE_CLIENT_ID")
+                  tenant_id = env("AZURE_TENANT_ID")
+                  subscription_id = env("AZURE_SUBSCRIPTION_ID")
+                  acr_name = env("AZURE_ACR_NAME")
+                  resource_group = env("AZURE_RESOURCE_GROUP")
+                  repo = env("GITHUB_REPOSITORY")
+                  sha = env("GITHUB_SHA")
+                  run_id = env("GITHUB_RUN_ID")
+
+                  token = mint_oidc_token(AZURE_OIDC_AUDIENCE)
+                  print("::add-mask::" + token)
+
+                  run(
+                      [
+                          "az",
+                          "login",
+                          "--service-principal",
+                          "-u",
+                          client_id,
+                          "-t",
+                          tenant_id,
+                          "--federated-token",
+                          token,
+                      ]
+                  )
+                  run(["az", "account", "set", "--subscription", subscription_id])
+
+                  workdir = "epic46-deploy-build"
+                  os.makedirs(workdir, exist_ok=True)
+                  for name in ("main.py", "Dockerfile"):
+                      content = fetch_raw(repo, sha, name)
+                      with open(os.path.join(workdir, name), "wb") as fh:
+                          fh.write(content)
+
+                  tag = image_tag(acr_name, run_id)
+                  run(["docker", "build", "-t", tag, workdir])
+                  run(["az", "acr", "login", "--name", acr_name])
+                  run(["docker", "push", tag])
+
+                  group_name = container_group_name(run_id)
+                  run(
+                      [
+                          "az",
+                          "container",
+                          "create",
+                          "--resource-group",
+                          resource_group,
+                          "--name",
+                          group_name,
+                          "--image",
+                          tag,
+                          "--cpu",
+                          "1",
+                          "--memory",
+                          "1",
+                          "--ports",
+                          "8080",
+                          "--restart-policy",
+                          "Never",
+                          "--assign-identity",
+                          "[system]",
+                          "--acr-identity",
+                          "[system]",
+                      ]
+                  )
+
+                  print(
+                      f"deploy: created container group {group_name!r} "
+                      f"from image {tag!r} in {resource_group!r}"
+                  )
+                  return 0
+              except DeployFailed as exc:
+                  print(f"deploy: FAILED -- {exc}", file=sys.stderr)
+                  return 1
+              except subprocess.CalledProcessError as exc:
+                  print(
+                      f"deploy: FAILED -- command exited {exc.returncode}: {exc.cmd}",
+                      file=sys.stderr,
+                  )
+                  return 1
+              except Exception as exc:  # noqa: BLE001 - fail closed on ANY unexpected error
+                  print(f"deploy: FAILED -- unexpected error: {exc}", file=sys.stderr)
+                  return 1
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
